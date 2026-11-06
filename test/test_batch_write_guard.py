@@ -98,18 +98,23 @@ def _read_frame(call_id: str = "tc-read") -> JsonRpcMessage:
     )
 
 
+#: A head sha no call of the batch had returned: the write quotes a guess.
+_UNSEEN_SHA = "1f69e7c13c1bb4c1b0bb1fa5b1e2f75c73a25ae0"
+_MERGE = f"gh pr merge 7 --squash --match-head-commit {_UNSEEN_SHA}"
+
+
 def _write_frame(call_id: str = "tc-write") -> JsonRpcMessage:
     return _tool_call_frame(
         call_id,
         "shell",
-        {"command": "gh pr merge 7 --squash"},
+        {"command": _MERGE},
         kind="execute",
-        title="Running: gh pr merge 7 --squash",
+        title=f"Running: {_MERGE}",
     )
 
 
 def _write_permission(request_id: int, call_id: str = "tc-write") -> AcpEvent:
-    command = "gh pr merge 7 --squash"
+    command = _MERGE
     return AcpEvent(
         kind=EVENT_PERMISSION_REQUEST,
         request_id=request_id,
@@ -203,7 +208,6 @@ def test_clearly_write_shell_commands_are_write_class(command):
         "aws s3 ls s3://bucket/",
         "aws logs filter-log-events --log-group-name g",
         "ls -la && cat README.md",
-        "python3 -m pytest -q test/test_x.py",
         "echo example-review-tool upload is a phrase here",
         # Write-shaped ARGUMENT text is not a write: only program words count.
         "git log --all --grep='git commit'",
@@ -214,13 +218,7 @@ def test_clearly_write_shell_commands_are_write_class(command):
         "echo '&&' git commit -m example",
         'echo ";" gh pr merge 1',
         # A here-document body is data for the command, not commands.
-        "cat > deploy.sh <<'EOF'\ngit push origin main\nEOF",
-        'cat <<"EOF" > n.md\ngh pr merge 7 --squash\nEOF\nls',
-        "cat <<-END > x\n\tgit commit -m y\n\tEND",
         "cat <<EOF\ngit push origin main",
-        # Known limit: the shared reader stops at a live ``<<``, so a write after
-        # the here-document's terminator is not judged either. It passes.
-        "cat > f <<'EOF'\nhello\nEOF\ngit push origin x",
         # An unquoted '#' word starts a comment that runs to the newline.
         "git status # && git commit -m example",
         "grep -rn 'gh pr merge' docs/",
@@ -238,13 +236,57 @@ def test_clearly_write_shell_commands_are_write_class(command):
         "gh api graphql --method=POST -fquery='query { viewer { login } }'",
         "aws logs tail /g --follow",
         "aws s3 presign s3://b/k",
+        # A redirect of stderr or to /dev/null writes no file.
+        "gh pr view 7 2>&1 | tail -3",
+        "grep -n x f.md 2>/dev/null",
+        "date -u > /dev/null",
+    ],
+)
+def test_a_value_producing_shell_command_is_read_class(command):
+    guard = _guard()
+    assert guard.classify(_shell(command)) == guard.READ
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -f .pr-body.md",
+        "mkdir -p out && ls out",
+        "mv a.md b.md",
+        "cp a.md b.md",
+        "echo done > status.txt",
+        "gh pr view 7 --json body >> notes.md",
+        "echo x | tee out.txt",
+        "python3 - <<'EOF'\nprint(1)\nEOF",
+        "node <<EOF\nconsole.log(1)\nEOF",
+        # A here-document body is not judged, but its redirect is a write.
+        "cat > deploy.sh <<'EOF'\ngit push origin main\nEOF",
+        'cat <<"EOF" > n.md\ngh pr merge 7 --squash\nEOF\nls',
+        "cat <<-END > x\n\tgit commit -m y\n\tEND",
+        "cat > f <<'EOF'\nhello\nEOF\ngit push origin x",
+    ],
+)
+def test_a_shell_command_with_a_side_effect_is_write_class(command):
+    guard = _guard()
+    assert guard.classify(_shell(command)) == guard.WRITE
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 -m pytest -q test/test_x.py",
+        "npm test",
+        "sleep 30",
+        "python3 gen.py",
+        "./scripts/build.sh",
         # Not a write until an operator lists it (see the extra-prefix tests).
         "example-review-tool upload --new-review",
     ],
 )
-def test_every_other_shell_command_is_read_class(command):
+def test_any_other_shell_command_is_neither_class(command):
+    # A test run, a build or an unknown script is neither a peer nor judged.
     guard = _guard()
-    assert guard.classify(_shell(command)) == guard.READ
+    assert guard.classify(_shell(command)) == ""
 
 
 def test_only_the_head_of_a_long_command_is_read():
@@ -255,7 +297,7 @@ def test_only_the_head_of_a_long_command_is_read():
     head = "x" * guard.MAX_CLASSIFIED_COMMAND_CHARS
     assert guard.classify_command(f"ls {head} && git push origin main") == guard.READ
     assert guard.classify_command(f"git push origin main && ls {head}") == guard.WRITE
-    assert guard.classify_command("x" * (2 * 1024 * 1024)) == guard.READ
+    assert guard.classify_command("x" * (2 * 1024 * 1024)) == ""
 
 
 _EXTRA = ("example-review-tool upload",)
@@ -285,7 +327,7 @@ def test_an_operator_listed_prefix_is_write_class(command):
 )
 def test_an_operator_prefix_matches_whole_leading_words_only(command):
     guard = _guard()
-    assert guard.classify(_shell(command), _EXTRA) == guard.READ
+    assert guard.classify(_shell(command), _EXTRA) != guard.WRITE
 
 
 @pytest.mark.parametrize("command", ["/usr/bin/rm report.json", "rm report.json"])
@@ -364,11 +406,26 @@ def test_an_unknown_tool_is_not_guarded():
 # ── batch window ──
 
 
+def _next_step(window) -> None:
+    """Move *window*'s clock past the gap grace, as the model's next step does."""
+    now = window._clock() + 1.0 + window_grace()
+    window._clock = lambda: now
+
+
+def window_grace() -> float:
+    return _guard().GAP_GRACE_SECS
+
+
+def _push(sha: str = _UNSEEN_SHA) -> str:
+    """A write that names a sha, so it carries a token the session never saw."""
+    return f"git push origin {sha}:refs/heads/x"
+
+
 def test_a_write_in_a_batch_with_a_read_is_refused():
     guard = _guard()
     window = guard.BatchWindow()
     window.dispatched("r", guard.READ)
-    window.dispatched("w", guard.WRITE)
+    window.dispatched("w", guard.WRITE, _push())
     reason = window.refusal_for("w", guard.WRITE)
     assert reason is not None
     assert "same parallel tool batch" in reason
@@ -379,7 +436,7 @@ def test_the_read_itself_is_never_refused():
     guard = _guard()
     window = guard.BatchWindow()
     window.dispatched("r", guard.READ)
-    window.dispatched("w", guard.WRITE)
+    window.dispatched("w", guard.WRITE, _push())
     assert window.refusal_for("r", guard.READ) is None
 
 
@@ -388,15 +445,27 @@ def test_a_read_that_returned_before_the_write_was_sent_is_a_different_batch():
     window = guard.BatchWindow()
     window.dispatched("r", guard.READ)
     window.settled("r")
-    window.dispatched("w", guard.WRITE)
+    _next_step(window)
+    window.dispatched("w", guard.WRITE, _push())
     assert window.refusal_for("w", guard.WRITE) is None
+
+
+def test_a_call_announced_within_the_gap_grace_joins_the_batch():
+    # A harness that announces a step's calls one at a time shows the next call
+    # right after the previous result: that is still the same model step.
+    guard = _guard()
+    window = guard.BatchWindow()
+    window.dispatched("r", guard.READ)
+    window.settled("r")
+    window.dispatched("w", guard.WRITE, _push())
+    assert window.refusal_for("w", guard.WRITE) is not None
 
 
 def test_a_read_that_settles_while_the_write_waits_still_shares_its_batch():
     guard = _guard()
     window = guard.BatchWindow()
     window.dispatched("r", guard.READ)
-    window.dispatched("w", guard.WRITE)
+    window.dispatched("w", guard.WRITE, _push())
     window.settled("r")
     assert window.refusal_for("w", guard.WRITE) is not None
 
@@ -404,8 +473,8 @@ def test_a_read_that_settles_while_the_write_waits_still_shares_its_batch():
 def test_writes_alone_and_unknown_peers_pass():
     guard = _guard()
     window = guard.BatchWindow()
-    window.dispatched("w1", guard.WRITE)
-    window.dispatched("w2", guard.WRITE)
+    window.dispatched("w1", guard.WRITE, _push("2a3b4c5d6e"))
+    window.dispatched("w2", guard.WRITE, _push())
     window.dispatched("x", "")
     assert window.refusal_for("w2", guard.WRITE) is None
 
@@ -422,7 +491,7 @@ def test_a_new_turn_starts_an_empty_window():
     window = guard.BatchWindow()
     window.dispatched("r", guard.READ)
     window.reset()
-    window.dispatched("w", guard.WRITE)
+    window.dispatched("w", guard.WRITE, _push())
     assert window.refusal_for("w", guard.WRITE) is None
 
 
@@ -446,7 +515,7 @@ def test_the_window_keeps_a_bounded_key_for_a_huge_id():
     huge = "i" * (1024 * 1024)
     window = guard.BatchWindow()
     window.dispatched("r", guard.READ)
-    window.dispatched(huge, guard.WRITE, "git push " + "x" * (1024 * 1024))
+    window.dispatched(huge, guard.WRITE, _push() + " " + "x" * (1024 * 1024))
     assert all(len(k) <= TOOL_CALL_CACHE_MAX_KEY_CHARS for k in window._members)
     assert all(
         len(m.command) <= guard.MAX_CLASSIFIED_COMMAND_CHARS for m in window._members.values()
@@ -455,6 +524,7 @@ def test_the_window_keeps_a_bounded_key_for_a_huge_id():
     assert window.refusal_for(huge, guard.WRITE) is not None
     window.settled(huge)
     window.settled("r")
+    _next_step(window)
     window.dispatched("next", guard.WRITE)
     assert len(window) == 1
 
@@ -465,13 +535,13 @@ def test_a_batch_of_operator_listed_writes_is_not_refused():
     guard = _guard()
     window = guard.BatchWindow()
     for cid, command in (
-        ("a", "example-review-tool upload a"),
+        ("a", f"example-review-tool upload {_UNSEEN_SHA}"),
         ("b", "example-review-tool upload b"),
     ):
         window.dispatched(cid, guard.classify_command(command), command)
     assert window.refusal_for("a", guard.WRITE, _EXTRA) is None
-    # Without the prefixes, the peer is a plain shell read.
-    assert window.refusal_for("a", guard.WRITE) is not None
+    # Without the prefixes, the peer is an unknown program: neither class.
+    assert window.refusal_for("a", guard.WRITE) is None
 
 
 def test_a_later_frame_for_a_settled_read_does_not_reopen_its_batch():
@@ -482,7 +552,8 @@ def test_a_later_frame_for_a_settled_read_does_not_reopen_its_batch():
     window.dispatched("r", guard.READ, "gh pr view 7")
     window.settled("r")
     window.dispatched("r", guard.READ, "gh pr view 7")
-    window.dispatched("w", guard.WRITE)
+    _next_step(window)
+    window.dispatched("w", guard.WRITE, _push())
     assert window.refusal_for("w", guard.WRITE) is None
 
 
@@ -535,7 +606,7 @@ def _client(tmp_path):
     client = AcpClient(work_dir=tmp_path)
     client._send_response = AsyncMock()
     client._send_error = AsyncMock()
-    return client
+    return _as_after_a_prompt(client)
 
 
 def _handle():
@@ -544,7 +615,15 @@ def _handle():
     runtime = MagicMock()
     runtime.send_response = AsyncMock()
     runtime.send_error = AsyncMock()
-    return AcpSessionHandle("s1", asyncio.Queue(), runtime)
+    return _as_after_a_prompt(AcpSessionHandle("s1", asyncio.Queue(), runtime))
+
+
+def _as_after_a_prompt(transport):
+    """The window as a sent prompt leaves it: ``refresh_feeding`` read the
+    (patched) setting off the loop before the prompt went out."""
+    guard = _guard()
+    transport._batch_window.set_feeding(guard.guard_settings()[0])
+    return transport
 
 
 def _feed(transport, msg):
@@ -712,6 +791,7 @@ async def test_transport_approves_the_same_write_once_the_read_returned(
     transport = make_transport(tmp_path)
     _feed(transport, _read_frame())
     _feed(transport, _settled_frame("tc-read"))
+    _next_step(transport._batch_window)
     _feed(transport, _write_frame())
     transport._permission_gate_events[42] = _write_permission(42)
 
@@ -764,7 +844,7 @@ async def test_transport_applies_the_operators_extra_write_commands(
     guard = _guard()
     monkeypatch.setattr(guard, "guard_settings", lambda: (True, extra))
     transport = make_transport(tmp_path)
-    command = "example-review-tool upload --new-review"
+    command = f"example-review-tool upload --new-review --parent {_UNSEEN_SHA}"
     _feed(transport, _read_frame())
     _feed(transport, _tool_frame("tc-upload", command))
     transport._permission_gate_events[44] = _shell_permission(44, "tc-upload", command)
@@ -792,12 +872,13 @@ def test_demo_refusal_text():
     from kiro_crew.deny_notice import build_refusal_steer_notice
 
     window = guard.BatchWindow()
-    window.dispatched("tc-read", guard.READ)
-    window.dispatched("tc-write", guard.WRITE)
+    window.dispatched("tc-read", guard.READ, "gh pr view 7 --json headRefOid")
+    window.dispatched("tc-write", guard.WRITE, _MERGE)
     reason = window.refusal_for("tc-write", guard.WRITE)
     assert reason is not None
+    assert _UNSEEN_SHA[:12] in reason
     notice = build_refusal_steer_notice(
-        "Running: gh pr merge 7 --squash", reason, cause=guard.DENY_CAUSE_BATCH_READ_WRITE
+        f"Running: {_MERGE}", reason, cause=guard.DENY_CAUSE_BATCH_READ_WRITE
     )
     print(notice)
     assert "batch guard" in notice
@@ -842,7 +923,9 @@ def _mcp_frame(call_id: str, server: str) -> JsonRpcMessage:
     )
 
 
-def _mcp_permission(request_id: int, call_id: str, server: str, tool: str) -> AcpEvent:
+def _mcp_permission(
+    request_id: int, call_id: str, server: str, tool: str, tool_input: str = ""
+) -> AcpEvent:
     return AcpEvent(
         kind=EVENT_PERMISSION_REQUEST,
         request_id=request_id,
@@ -851,6 +934,7 @@ def _mcp_permission(request_id: int, call_id: str, server: str, tool: str) -> Ac
         mcp_server_name=server,
         tool_name=tool,
         mcp_identity_trusted=True,
+        tool_input=tool_input,
     )
 
 
@@ -871,7 +955,11 @@ async def test_a_peer_named_only_by_its_permission_request_still_counts(
         46, "tc-ledger-read", "kirocrew-work", "work_ledger_read"
     )
     transport._permission_gate_events[47] = _mcp_permission(
-        47, "tc-ledger-write", "kirocrew-work", "work_ledger_record"
+        47,
+        "tc-ledger-write",
+        "kirocrew-work",
+        "work_ledger_record",
+        json.dumps({"action": "decide", "item_id": "it_9fc6cc99"}),
     )
 
     assert await transport.approve_tool(46) is True
@@ -989,6 +1077,7 @@ async def test_a_refused_write_resent_alone_is_approved_without_its_own_terminal
     assert await transport.approve_tool(60) is False
 
     _feed(transport, _settled_frame("tc-read"))
+    _next_step(transport._batch_window)
     _feed(transport, _write_frame("tc-write-again"))
     transport._permission_gate_events[61] = _write_permission(61, "tc-write-again")
     assert await transport.approve_tool(61) is True
@@ -1002,17 +1091,17 @@ def test_a_read_whose_terminal_is_lost_stops_holding_the_batch_open():
     now = [1000.0]
     window = guard.BatchWindow(clock=lambda: now[0])
     window.dispatched("r", guard.READ)
-    window.dispatched("w", guard.WRITE)
+    window.dispatched("w", guard.WRITE, _push("a1b2c3d4e5"))
     assert window.refusal_for("w", guard.WRITE) is not None
     window.settled("w")
 
     now[0] += guard.OPEN_MEMBER_TTL_SECS - 1
-    window.dispatched("w2", guard.WRITE)
+    window.dispatched("w2", guard.WRITE, _push("b2c3d4e5f6"))
     assert window.refusal_for("w2", guard.WRITE) is not None
     window.settled("w2")
 
     now[0] += 2
-    window.dispatched("w3", guard.WRITE)
+    window.dispatched("w3", guard.WRITE, _push("c3d4e5f6a7"))
     assert window.refusal_for("w3", guard.WRITE) is None
 
 
@@ -1084,6 +1173,6 @@ def test_an_inputless_refinement_keeps_a_members_known_class():
     guard = _guard()
     window = guard.BatchWindow()
     window.dispatched("r", guard.READ, "gh pr view 7")
-    window.dispatched("w", guard.WRITE, "gh pr merge 7")
+    window.dispatched("w", guard.WRITE, _MERGE)
     guard.note_refined(window, _event(tool_call_id="r", is_shell=True, tool_name="shell"))
     assert window.refusal_for("w", guard.WRITE) is not None

@@ -92,6 +92,10 @@ def _effect(entry: dict[str, Any], server: str, tool: str) -> str:
     return "ask"
 
 
+#: What the write sends: a head sha no call of its batch had returned.
+_SEND_INPUT = '{"message": "merged as 1f69e7c13c1bb4c1b0bb1fa5b1e2f75c73a25ae0"}'
+
+
 def _permission(request_id: int, call_id: str, server: str, tool: str, granted) -> AcpEvent:
     return AcpEvent(
         kind=EVENT_PERMISSION_REQUEST,
@@ -103,6 +107,7 @@ def _permission(request_id: int, call_id: str, server: str, tool: str, granted) 
         mcp_identity_trusted=True,
         kas_builtin_ids=True,
         spec_granted_builtins=frozenset(granted),
+        tool_input=_SEND_INPUT,
     )
 
 
@@ -132,7 +137,10 @@ def _handle():
     runtime = MagicMock()
     runtime.send_response = AsyncMock()
     runtime.send_error = AsyncMock()
-    return AcpSessionHandle("s1", asyncio.Queue(), runtime)
+    handle = AcpSessionHandle("s1", asyncio.Queue(), runtime)
+    # As a sent prompt leaves it: the (patched) setting read off the loop.
+    handle._batch_window.set_feeding(_guard().guard_settings()[0])
+    return handle
 
 
 # ── (a) a write batched with a read, both granted ──────────────────────────────
@@ -183,7 +191,7 @@ def test_an_authored_allow_on_a_whole_server_still_asks_for_its_writes(guard_on)
     assert _effect(entry, "kirocrew-core", "session_ledger_record") == "ask"
     assert _effect(entry, "kirocrew-work", "work_ledger_record") == "ask"
     assert _effect(entry, "kirocrew-core", "memory_recall") == "allow"
-    assert _effect(entry, "kirocrew-core", "spawn_run") == "allow"
+    assert _effect(entry, "kirocrew-core", "skill_search") == "allow"
     granted = kas_agents.projected_crew_answered([entry], "lead")
     assert {
         "@kirocrew-core/send_message",
