@@ -3,8 +3,10 @@ ladder, the channel target, and the linked-Slack and cross-surface legs."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.dashboard.chat_utils import (
@@ -15,7 +17,14 @@ from kiro_crew.dashboard.chat_utils import (
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.egress import channel_egress_parts, send_channel_parts
 from kiro_crew.messaging.link import CHAT_TYPE_DIRECT, parse_session_key
+from kiro_crew.messaging.outbound_files import (
+    OutboundFile,
+    extract_local_refs_off_loop,
+    iter_local_refs,
+    strip_url_syntax,
+)
 from kiro_crew.messaging.renderer import split_options_trailer
+from kiro_crew.messaging.upload_gate import uploads_restricted
 from kiro_crew.mirror_admission import admission_required, verify_mirror_admission
 from kiro_crew.platform import redact_via_context
 
@@ -630,6 +639,95 @@ def _cross_surface_reply_text(segments: list[str], trailing: str) -> str:
     return "\n\n".join([*(e for e in earlier if e), segments[-1]])
 
 
+#: Refusal lines a mirrored reply's follow-up names before the rest collapse into a
+#: count -- the Feishu renderer's own budget.
+_MAX_REJECTION_LINES = 3
+
+
+async def _cross_surface_images(
+    state: Any, session_key: str, link: Any, transport: Any, text: str
+) -> tuple[str, list[OutboundFile], list[str]]:
+    """Pull the reply's local image references out for *transport* to upload.
+
+    Returns ``(text, files, notes)``: the text without the references it will
+    send, the validated files, and one ``⚠`` line per refused reference. Every
+    gate is the channel renderer's own, so this leg sends exactly the pictures a
+    channel-driven turn of the same session would: the transport declares
+    ``files_outbound``, a proactive upload verb and budgets for this conversation
+    (``send_outbound_image`` / ``outbound_image_limits``); the session is not
+    restricted (``upload_gate.uploads_restricted``, the shared ceiling); and the
+    approved roots are the live provider's own ``cwd`` and ``$KIROCREW_SCRATCH``,
+    read the way the channel dispatchers read them at ``bind_provider``. Any gate
+    that does not answer leaves the text whole, which is today's behaviour.
+    """
+    unchanged: tuple[str, list[OutboundFile], list[str]] = (text, [], [])
+    if not getattr(transport.capabilities, "files_outbound", False):
+        return unchanged
+    budgets = getattr(transport, "outbound_image_limits", None)
+    if not callable(budgets) or not callable(getattr(transport, "send_outbound_image", None)):
+        return unchanged
+    # The transport's answer for THIS conversation: None where a channel-driven
+    # turn would upload nothing either (a Feishu group).
+    limits = budgets(link.channel_id, link.thread_id)
+    if limits is None:
+        return unchanged
+    # A peek: a reply is delivered after its turn, so the provider that wrote it
+    # is still bound; none means no root, and no root means no upload.
+    get_provider = getattr(getattr(state, "sessions", None), "get_provider", None)
+    provider = get_provider(session_key) if callable(get_provider) else None
+    root = str(getattr(provider, "cwd", "") or "")
+    if not os.path.isabs(root):
+        return unchanged
+    scratch = str(getattr(provider, "work_scratch_dir", None) or "")
+    # Off-loop like the renderers' scans; asked first so a reply with no picture
+    # costs no session probe and writes no restricted-session audit row.
+    if not await asyncio.to_thread(iter_local_refs, text):
+        return unchanged
+    # circular import: the handlers package imports the dashboard chat world.
+    from kiro_crew.dashboard.handlers._shared import _probe_persisted_session
+
+    if await uploads_restricted(
+        state,
+        session_key,
+        channel_type=link.channel_type,
+        persisted_probe=_probe_persisted_session,
+    ):
+        return unchanged
+    try:
+        result = await extract_local_refs_off_loop(
+            text,
+            within_root=root,
+            limits=limits,
+            scratch_root=scratch if os.path.isabs(scratch) else "",
+        )
+    except Exception:
+        logger.warning("cross-surface: outbound image extraction failed", exc_info=True)
+        return unchanged
+    operation = f"{link.channel_type}_mirror.upload_files"
+    if result.rejections:
+        sel().log_api_access(
+            caller=session_key,
+            operation=operation,
+            outcome="denied",
+            source=link.channel_type,
+            resources=f"{len(result.rejections)} rejection(s)",
+            # Only the closed reason CODES, never the LLM-authored destination.
+            error=",".join(sorted({item.reason for item in result.rejections})),
+        )
+    if result.files:
+        sel().log_api_access(
+            caller=session_key,
+            operation=operation,
+            outcome="allowed",
+            source=link.channel_type,
+            resources=f"{len(result.files)} file(s)",
+        )
+    notes = [f"⚠ {rejection}" for rejection in result.rejections[:_MAX_REJECTION_LINES]]
+    if len(result.rejections) > _MAX_REJECTION_LINES:
+        notes.append(f"⚠ …and {len(result.rejections) - _MAX_REJECTION_LINES} more")
+    return result.rewritten_text.strip(), list(result.files), notes
+
+
 async def _deliver_cross_surface_reply(
     state: Any, session_key: str, assistant_text: str, *, slot: Any = None
 ) -> None:
@@ -690,18 +788,44 @@ async def _deliver_cross_surface_reply(
     if target is None:
         return
     link, transport = target
+    # Local images first, BEFORE any splitter (the outbound-files contract): a
+    # reference cut in half by chunking is unrecognisable to extraction.
+    text, images, notes = await _cross_surface_images(
+        state, session_key, link, transport, assistant_text
+    )
     # Strip, display-redact, number the ``[OPTIONS:]`` choices (``send_message``
     # takes none, so the mirror builds no button), chunk and send: the shared
     # unattended-egress leg, ``messaging.egress``. Chunking keeps a long reply
     # whole rather than hard-truncated by the transport (Telegram caps at 4096).
-    parts = await channel_egress_parts(assistant_text, transport.capabilities, number_options=True)
+    # An answer that was nothing but images sends only the images.
+    parts = (
+        await channel_egress_parts(text, transport.capabilities, number_options=True)
+        if text or not images
+        else []
+    )
     try:
         await send_channel_parts(transport, link.channel_id, parts, thread_id=link.thread_id)
+        for image in images:
+            if not await transport.send_outbound_image(
+                link.channel_id, image, thread_id=link.thread_id
+            ):
+                # Extraction cut this reference out of the text, so a failed
+                # upload names its path rather than leave a reply about a picture
+                # with no picture.
+                notes.append(f"⚠ Couldn't upload: {image.path}")
+        if notes:
+            # A follow-up rather than appended text: prose after an
+            # ``[OPTIONS:]`` trailer would break its parse.
+            note_parts = await channel_egress_parts("\n".join(notes), transport.capabilities)
+            await send_channel_parts(
+                transport, link.channel_id, note_parts, thread_id=link.thread_id
+            )
         logger.info(
-            "cross-surface: mirrored reply to %s:%s (%d part(s))",
+            "cross-surface: mirrored reply to %s:%s (%d part(s), %d image(s))",
             link.channel_type,
             link.channel_id,
             len(parts),
+            len(images),
         )
     except Exception:
         logger.debug("Failed to mirror reply to %s", link.channel_type, exc_info=True)
@@ -730,10 +854,12 @@ async def _deliver_cross_surface_user_message(
     if target is None:
         return
     link, transport = target
+    # Off-loop: the image scan walks the whole message.
+    echo = await asyncio.to_thread(_name_local_attachments, user_message)
     try:
         await transport.send_message(
             link.channel_id,
-            f"💬 {_prepare_mirror_msg(user_message)}",
+            f"💬 {_prepare_mirror_msg(echo)}",
             thread_id=link.thread_id,
         )
         logger.info(
@@ -743,6 +869,36 @@ async def _deliver_cross_surface_user_message(
         )
     except Exception:
         logger.debug("Failed to mirror user message to %s", link.channel_type, exc_info=True)
+
+
+#: What a dashboard attachment reads as in the cross-surface echo.
+_ECHO_IMAGE_PREFIX = "🖼 "
+_ECHO_FILE_PREFIX = "📎 "
+
+
+def _name_local_attachments(message: str) -> str:
+    """*message* with each dashboard attachment named instead of its server path.
+
+    The composer writes a pasted picture as ``![image](<uploads path>)`` and a
+    file as ``[attached_file N] <uploads path>``; mirrored as typed, the channel
+    shows a path on this host that no phone can open. Each becomes its file
+    name; the file itself stays in the dashboard. The bytes are NOT sent: the
+    uploads store is no root a channel upload admits (only the provider's cwd and
+    scratch are), so sending them would widen what may leave this host. The image scan is the
+    channel renderers' own (``outbound_files.iter_local_refs``), and the file
+    marker parse is the title path's (``chat_title._strip_attached_file_tokens``).
+
+    Blocking (a full scan of the message); call it off the event loop.
+    """
+    # circular import: chat_title imports the dashboard state this package is part of.
+    from kiro_crew.dashboard.chat_title import _strip_attached_file_tokens
+
+    for ref in reversed(iter_local_refs(message)):
+        name = strip_url_syntax(ref.dest).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        label = f"{_ECHO_IMAGE_PREFIX}{name}" if name else ""
+        message = message[: ref.start] + label + message[ref.end :]
+    named = _strip_attached_file_tokens(message, (), labels={}, label_prefix=_ECHO_FILE_PREFIX)
+    return named.strip() if named != message else message
 
 
 _MIRROR_ECHO_LIMIT = 500

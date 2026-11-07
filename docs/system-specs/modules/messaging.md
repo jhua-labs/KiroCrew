@@ -7161,6 +7161,15 @@ uploads are SEL-audited as `feishu_renderer.upload_files` with reason codes and
 counts only. The ceiling reads the durable privacy flags through the dispatcher's
 `dashboard_state`, which `maybe_start_feishu` sets.
 
+The dashboard → Feishu reply mirror sends the same pictures through
+`FeishuTransport.send_outbound_image` (a NEW `msg_type=image` message via
+`LarkClient.send_new_image`, the same upload as the reply), under the renderer's
+own `FEISHU_UPLOAD_LIMITS`. `outbound_image_limits(conversation_id, thread_id)`
+answers those budgets for an allow-listed `open_id` and None for anything else,
+so a group mirror is never extracted and keeps the path exactly as a group turn
+does; the verb re-checks the address at the send and answers False there too. See the session spec's cross-surface Delivery
+paragraph for the leg's own gates.
+
 **Session identity.** A p2p turn keys on `open_id` under the `DIRECT` chat
 type; a group turn keys on the group's `chat_id` under the non-direct
 (`FORUM`) chat type, so a group turn never resumes the sender's private DM

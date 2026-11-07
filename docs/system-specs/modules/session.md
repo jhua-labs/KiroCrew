@@ -4932,6 +4932,26 @@ governance error — matching the Slack path). Egress text is redacted through t
 canonical `redact_via_context` shim so a loaded companion's extra
 credential/token regexes apply.
 
+**Local images and attachments on the mirror.** The reply leg runs the channel
+renderers' extraction (`messaging.outbound_files.extract_local_refs_off_loop`)
+BEFORE splitting, through the renderers' own gates: the transport declares
+`files_outbound`, a proactive upload verb
+(`send_outbound_image(conversation_id, file, *, thread_id) -> bool`) and budgets
+for THIS conversation (`outbound_image_limits(conversation_id, thread_id)`, None
+where a channel-driven turn would upload nothing either); Feishu declares both,
+every other transport neither, so its mirror keeps printing the path; the session passes the shared
+`upload_gate.uploads_restricted` ceiling; and the approved roots are the live
+provider's `cwd` and `work_scratch_dir`, peeked with `sessions.get_provider`. Any
+gate that does not answer leaves the text whole. The text goes first (none for an
+image-only answer), then each image; refused references keep their markup, and
+their `⚠` lines plus any failed upload's path follow in one separate message, so
+an `[OPTIONS:]` trailer still ends the answer. Refusals and uploads are
+SEL-audited as `<channel>_mirror.upload_files` with reason codes and counts only.
+The user-message echo sends no bytes: a pasted `![image](<path>)` and an
+`[attached_file N] <path>` marker become `🖼 <name>` / `📎 <name>`
+(`_name_local_attachments`), because the dashboard uploads store is not a root
+any channel upload admits.
+
 **Known asymmetry / future work.** Slack already runs the unified one-session
 model; the other transports run two sessions bridged by the mirror. Folding the
 dashboard channel tab into the channel session (as Slack does) would remove the
