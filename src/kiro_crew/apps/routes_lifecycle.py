@@ -3,8 +3,9 @@
 The minimum-version check, warning redaction, registering and deregistering an app off
 the event loop, starting a backend after an install and stopping one with its outcome
 observed, whether an app may run once installed, restoring an app after a failed update,
-suspending one for session-approval reconsent, the refusal while a startup hook still
-runs, and dropping an app's notification channels.
+re-installing an installed app from the registry, suspending one for session-approval
+reconsent, the refusal while a startup hook still runs, and dropping an app's
+notification channels.
 
 Part of the ``kiro_crew.apps.routes`` family: callers and tests reach every name here
 as ``kiro_crew.apps.routes.<name>``, and a patch there reaches this module too
@@ -34,6 +35,7 @@ from kiro_crew.apps.bridges import (
 )
 from kiro_crew.apps.hooks_integration import stop_retained_startup_hooks
 from kiro_crew.apps.manager import get_app
+from kiro_crew.apps.registry import install_from_registry
 from kiro_crew.apps.version import check_min_version as _check_min_version_str
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.sel import sel
@@ -274,6 +276,43 @@ async def _restore_app_after_failed_update(
     except Exception:
         logger.warning("Re-register after failed update failed for app %s", name, exc_info=True)
     return await _start_backend_after_install(name)
+
+
+async def _reinstall_from_registry(
+    name: str, registry_name: str, log_lines: list[str] | None = None
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]] | None]:
+    """Re-install installed *name* from the registry, taking it down only to replace it.
+
+    ``install_from_registry`` awaits the take-down right before it copies a managed
+    app's new files in, so a refusal or a failed clone, build or ``onInstall`` leaves
+    the app running. The take-down stops the backend (on Windows the copy fails while
+    it holds a file open under the tree), then deregisters: the app-kit-platform §17
+    order. A failure after it restores the app (:func:`_restore_app_after_failed_update`).
+
+    Returns the install result and the pre-deregister agent-config snapshot the
+    caller hands to :func:`_register_app_off_loop` on success.
+    """
+    taken_down = False
+    prior_agents: dict[str, dict[str, Any]] | None = None
+
+    async def _take_down() -> None:
+        nonlocal taken_down, prior_agents
+        taken_down = True
+        await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), stop_app_backend, name
+        )
+        # Deregistering deletes the agent configs that hold the user's edits.
+        prior_agents = await _snapshot_agent_configs_off_loop(name)
+        await _deregister_app_off_loop(name)
+
+    result = await install_from_registry(
+        registry_name, log_lines=log_lines, before_replace=_take_down
+    )
+    if taken_down and not result.get("ok"):
+        restore_refused = await _restore_app_after_failed_update(name, prior_agents)
+        if restore_refused:
+            result["backend_refused"] = restore_refused
+    return result, prior_agents
 
 
 async def _suspend_app_for_session_approval_reconsent(

@@ -1,11 +1,12 @@
 """An app update keeps the user's own edits in the app's materialized agent configs.
 
-Both update branches of ``POST /api/apps/{name}/update`` deregister the app before they
-re-register it, and deregistering deletes ``<agents dir>/<app>--<agent>.json``. The
-registration that follows can only carry a user's edits (``model``, ``description``,
-``welcomeMessage``...) across the refresh if it is handed what was on disk BEFORE that
-delete, so the route snapshots the files first. A framework-owned key still refreshes
-from the new template, and the failed-update restore keeps the edits too.
+Both update branches of ``POST /api/apps/{name}/update``, and a registry install over an
+installed app, deregister the app before they re-register it, and deregistering deletes
+``<agents dir>/<app>--<agent>.json``. The registration that follows can only carry a
+user's edits (``model``, ``description``, ``welcomeMessage``...) across the refresh if it
+is handed what was on disk BEFORE that delete, so the route snapshots the files first. A
+framework-owned key still refreshes from the new template, and the failed-update restore
+keeps the edits too.
 """
 
 from __future__ import annotations
@@ -87,12 +88,26 @@ class TestUpdateKeepsAgentEdits:
         _assert_edits_kept(tmp_path, tools=_V2["tools"])
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("path", "body", "status"),
+        [
+            (f"/api/apps/{APP}/update", {}, 200),
+            ("/api/apps/registry/install", {"name": APP}, 201),
+            ("/api/apps/registry/install-stream", {"name": APP}, 200),
+        ],
+    )
     async def test_a_registry_update_keeps_the_users_agent_edits(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        path: str,
+        body: dict[str, Any],
+        status: int,
     ) -> None:
         v2 = _installed_with_edits(tmp_path, monkeypatch)
 
         async def _install_v2(name: str, **kwargs: Any) -> dict[str, Any]:
+            await kwargs["before_replace"]()
             result = await asyncio.to_thread(update_app, v2, expected_name=name)
             return {"ok": result.ok, "name": name, "error": result.error}
 
@@ -101,8 +116,9 @@ class TestUpdateKeepsAgentEdits:
         monkeypatch.setattr(routes_mod, "install_from_registry", _install_v2)
 
         async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
-            resp = await client.post(f"/api/apps/{APP}/update", json={})
-            assert resp.status == 200, await resp.text()
+            resp = await client.post(path, json=body)
+            text = await resp.text()  # the stream route installs while it streams
+            assert resp.status == status, text
 
         _assert_edits_kept(tmp_path, tools=_V2["tools"])
 
@@ -113,7 +129,8 @@ class TestUpdateKeepsAgentEdits:
         _installed_with_edits(tmp_path, monkeypatch)
 
         async def _failed_install(name: str, **kwargs: Any) -> dict[str, Any]:
-            return {"ok": False, "name": name, "error": "clone failed"}
+            await kwargs["before_replace"]()
+            return {"ok": False, "name": name, "error": "copy failed"}
 
         monkeypatch.setattr(routes_mod, "is_registry_source", lambda s: True)
         monkeypatch.setattr(routes_mod, "registry_name_from_source", lambda s: APP)

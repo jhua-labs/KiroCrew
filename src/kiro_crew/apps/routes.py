@@ -345,6 +345,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _redact_warning,
         _refuse_while_startup_hook_runs,
         _register_app_off_loop,
+        _reinstall_from_registry,
         _restore_app_after_failed_update,
         _snapshot_agent_configs_off_loop,
         _start_backend_after_install,

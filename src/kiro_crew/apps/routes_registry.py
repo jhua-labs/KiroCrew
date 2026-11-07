@@ -47,6 +47,7 @@ from kiro_crew.apps.routes_install import _resync_app_crons_after_update
 from kiro_crew.apps.routes_lifecycle import (
     _app_may_run_after_install,
     _register_app_off_loop,
+    _reinstall_from_registry,
     _start_backend_after_install,
     _suspend_app_for_session_approval_reconsent,
 )
@@ -199,9 +200,14 @@ async def handle_registry_install(request: web.Request) -> web.Response:
     # single acquisition covering clone/build → copy → register → backend.
     async with app_lifecycle_lock(name):
         # Read before the install writes the app: an app already installed makes
-        # this install an update, whose rewritten crons must reach the scheduler.
+        # this install an update, which takes the app down to replace its files and
+        # whose rewritten crons must reach the scheduler.
         was_installed = await asyncio.to_thread(lambda: get_app(name) is not None)
-        result = await install_from_registry(name)
+        prior_agents = None
+        if was_installed:
+            result, prior_agents = await _reinstall_from_registry(name, name)
+        else:
+            result = await install_from_registry(name)
 
         # Redact install log and error before returning to client — build output
         # may contain internal hostnames, package URLs, or credential fragments.
@@ -238,7 +244,7 @@ async def handle_registry_install(request: web.Request) -> web.Response:
             reg = await _suspend_app_for_session_approval_reconsent(result["name"])
         else:
             # Auto-register resources
-            reg = await _register_app_off_loop(result["name"])
+            reg = await _register_app_off_loop(result["name"], prior_agents)
             if was_installed:
                 # A re-install over an installed, still-enabled app is an
                 # update: carry its rewritten crons into the running scheduler
@@ -368,7 +374,13 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
         async with app_lifecycle_lock(name):
             # Read before the install, as in handle_registry_install.
             was_installed = await asyncio.to_thread(lambda: get_app(name) is not None)
-            r = await install_from_registry(name, log_lines=streaming_log)
+            prior_agents = None
+            if was_installed:
+                r, prior_agents = await _reinstall_from_registry(
+                    name, name, log_lines=streaming_log
+                )
+            else:
+                r = await install_from_registry(name, log_lines=streaming_log)
             if r.get("ok") and not r.get("needsClientInstall"):
                 may_run = await _app_may_run_after_install(r["name"])
                 if not may_run:
@@ -377,7 +389,7 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
                     reg = await _suspend_app_for_session_approval_reconsent(r["name"])
                     r["registration"] = reg.to_dict()
                 else:
-                    reg = await _register_app_off_loop(r["name"])
+                    reg = await _register_app_off_loop(r["name"], prior_agents)
                     if was_installed:
                         # An update, as in handle_registry_install.
                         await _resync_app_crons_after_update(request, r["name"])
